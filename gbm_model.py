@@ -7,15 +7,19 @@ Con eso se calcula en forma cerrada:
   - bandas de precio por percentil para cada minuto del horizonte
   - en qué percentil cae el precio actual respecto a lo esperado desde hace `ancla` minutos  -> señal
   - probabilidad de tocar el take-profit antes que el stop-loss (fórmula de barreras)
+
+sigma se calibra a la escala del ancla (ver common.estimar_parametros) y el ancla nunca cruza al día anterior.
 """
 import math
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from common import estimar_parametros, norm_cdf, norm_ppf, senal, explicar_senal
+from common import (estimar_parametros, norm_cdf, norm_cdf_vec, norm_ppf, senal, explicar_senal,
+                    minutos_en_sesion_actual, percentil_empirico, calibracion)
 
 PERCENTILES = (5, 10, 25, 50, 75, 90, 95)
+MIN_ANCLA = 5
 
 
 def proyeccion(S0, m, sigma, horizonte, percentiles=PERCENTILES):
@@ -46,15 +50,33 @@ def prob_tp_antes_sl(S0, tp, sl, m, sigma):
     return (1 - math.exp(-k * l)) / (math.exp(-k * u) - math.exp(-k * l))
 
 
-def analizar(closes, S_now, horizonte=60, ancla=60, umbral_compra=10, umbral_venta=90):
-    """Corre el modelo completo. `closes` = cierres de 1 min (histórico), `S_now` = precio actual."""
+def analizar(closes, S_now, horizonte=60, ancla=60, umbral_compra=10, umbral_venta=90,
+             sesiones=None, usar_drift=False):
+    """
+    closes   = cierres de 1 min (histórico), S_now = precio actual
+    sesiones = etiqueta de sesión (fecha) por cada cierre; evita cruzar la noche al estimar y al anclar
+    """
     closes = np.asarray(closes, dtype=float)
-    p = estimar_parametros(closes)
-    ancla = int(min(ancla, len(closes) - 1))
-    S_ancla = float(closes[-1 - ancla])
+    p = estimar_parametros(closes, sesiones, escala=ancla, usar_drift=usar_drift)
 
-    pct, z = percentil_actual(S_now, S_ancla, p["m"], p["sigma"], ancla)
+    # ancla: nunca más atrás que la apertura de la sesión actual
+    disp = minutos_en_sesion_actual(closes, sesiones)
+    n = int(max(0, min(ancla, disp, len(closes) - 1)))
+    nota = ""
+    if n < MIN_ANCLA:
+        pct, z, S_ancla, n = 50.0, 0.0, float(closes[-1]), max(n, 1)
+        nota = "Primeros minutos de la sesión: aún no hay ventana para medir."
+    else:
+        S_ancla = float(closes[-1 - n])
+        pct, z = percentil_actual(S_now, S_ancla, p["m"], p["sigma"], n)
+        if n < ancla:
+            nota = f"Sesión recién abierta: midiendo desde hace {n} min (no {ancla})."
     s = senal(pct, umbral_compra, umbral_venta)
+
+    # calibración: percentil que este mismo modelo le habría dado a cada ventana real del histórico
+    pct_hist = 100 * norm_cdf_vec((p["ventanas"] - p["m"] * p["escala"]) / (p["sigma"] * math.sqrt(p["escala"])))
+    cal = calibracion(pct_hist, umbral_compra, umbral_venta)
+    pct_emp = percentil_empirico(math.log(S_now / S_ancla), p["ventanas"]) if n == ancla else float("nan")
 
     t, bandas, media = proyeccion(S_now, p["m"], p["sigma"], horizonte)
     tp, sl = float(bandas[90][-1]), float(bandas[10][-1])
@@ -63,12 +85,15 @@ def analizar(closes, S_now, horizonte=60, ancla=60, umbral_compra=10, umbral_ven
         "modelo": "GBM analítico",
         "precio": S_now,
         "precio_ancla": S_ancla,
-        "ancla": ancla,
+        "ancla": n,
+        "nota": nota,
         "horizonte": horizonte,
         "percentil": pct,
+        "percentil_empirico": pct_emp,
+        "calibracion": cal,
         "z": z,
         "senal": s,
-        "explicacion": explicar_senal(s, pct, ancla),
+        "explicacion": explicar_senal(s, pct, n),
         "params": p,
         "t": t,
         "bandas": bandas,
@@ -105,13 +130,16 @@ def figura(df, res, n_hist=120):
 
 
 def resumen(res):
-    p = res["params"]
+    p, c = res["params"], res["calibracion"]
     lines = [
         f"== {res['modelo']} ==",
         f"Precio actual: {res['precio']:.2f}   (hace {res['ancla']} min: {res['precio_ancla']:.2f})",
-        f"sigma/min {p['sigma']*100:.3f}%  | sigma/día {p['sigma_dia']*100:.2f}%  | drift/hora {p['m']*60*100:+.3f}%",
-        f"Percentil del precio actual: {res['percentil']:.1f}  (z = {res['z']:+.2f})",
-        f"SEÑAL: {res['senal']}  -> {res['explicacion']}",
+        f"sigma/min bruta {p['sigma1']*100:.3f}% -> calibrada a {p['escala']} min {p['sigma']*100:.3f}% "
+        f"(ratio {p['vr']:.2f}) | sigma/{p['escala']}min {p['sigma_h']*100:.2f}% | "
+        f"drift/hora {p['m_est']*60*100:+.3f}% ({'usado' if p['usar_drift'] else 'ignorado'})",
+        f"Percentil del precio actual: {res['percentil']:.1f}  (z = {res['z']:+.2f}) | empírico {res['percentil_empirico']:.0f}",
+        f"Calibración {c['n']} ventanas: zona COMPRA {c['compra']:.0f}% · zona VENTA {c['venta']:.0f}%",
+        f"SEÑAL: {res['senal']}  -> {res['explicacion']}" + (f"  [{res['nota']}]" if res["nota"] else ""),
         f"Niveles a {res['horizonte']} min: " + "  ".join(f"{k}={v:.2f}" for k, v in res["niveles_horizonte"].items()),
         f"Take-profit {res['take_profit']:.2f} | Stop-loss {res['stop_loss']:.2f} | "
         f"P(sube) {res['prob_subir']*100:.0f}% | P(TP antes que SL) {res['prob_tp_antes_sl']*100:.0f}%",
@@ -125,7 +153,8 @@ if __name__ == "__main__":
 
     df, px, ts = da.cargar(config.SYMBOL, config.ALPACA_KEY, config.ALPACA_SECRET,
                            dias=config.DIAS_HISTORIA, feed=config.FEED, solo_regular=config.SOLO_HORARIO_REGULAR)
-    res = analizar(df["close"].values, px, config.HORIZONTE, config.ANCLA, config.UMBRAL_COMPRA, config.UMBRAL_VENTA)
+    res = analizar(df["close"].values, px, config.HORIZONTE, config.ANCLA, config.UMBRAL_COMPRA, config.UMBRAL_VENTA,
+                   sesiones=df["t"].dt.date.values, usar_drift=config.USAR_DRIFT)
     print(f"{config.SYMBOL} @ {ts}\n")
     print(resumen(res))
     fig = figura(df, res)

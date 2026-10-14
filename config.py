@@ -30,6 +30,11 @@ ALPACA_KEY = _llave("APCA_API_KEY_ID")
 ALPACA_SECRET = _llave("APCA_API_SECRET_KEY")
 
 SYMBOL = "SMCI"
+SIMBOLOS_ALERTA = ["SMCI"]   # alertas.py vigila estos (ej. ["SMCI", "NVDA", "QBTS"])
+
+# Telegram (para alertas.py). Mismo sitio que las llaves de Alpaca: secrets.toml o variables de entorno.
+TELEGRAM_TOKEN = _llave("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = _llave("TELEGRAM_CHAT_ID")
 
 # "iex"  = tiempo real en el plan gratis (solo trades que pasan por la bolsa IEX).
 # "sip"  = mercado completo, pero en el plan gratis NO deja pedir los últimos 15 min.
@@ -43,7 +48,9 @@ HORIZONTE = 60      # cuántos minutos hacia adelante proyectar
 ANCLA = 60          # desde cuántos minutos atrás se mide dónde está el precio hoy
 UMBRAL_COMPRA = 10  # percentil <= esto -> zona de compra
 UMBRAL_VENTA = 90   # percentil >= esto -> zona de venta
+USAR_DRIFT = False  # False = tendencia intradía = 0 (en 5 días el drift es ruido y sesga la señal hacia la tendencia reciente)
 
 # Solo Montecarlo
 N_SIMULACIONES = 10000
-MODO_MC = "bootstrap"   # "bootstrap" = remuestrea retornos reales (colas gordas) | "normal" = gaussiano
+MODO_MC = "bootstrap"   # "bootstrap" = copia tramos de retornos reales (colas gordas) | "normal" = gaussiano
+BLOQUE_MC = 30          # minutos por tramo en el block bootstrap (conserva la autocorrelación de corto plazo)

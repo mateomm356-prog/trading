@@ -2,10 +2,12 @@
 MODELO 2 — Simulación Montecarlo.
 
 Genera miles de trayectorias de precio minuto a minuto y saca todo de la nube de caminos:
-  - modo "bootstrap": cada incremento se remuestrea de los retornos REALES de 1 min (respeta colas gordas,
-    no asume normalidad). Es lo que lo hace distinto del GBM analítico.
-  - modo "normal": incrementos gaussianos con la misma media y sigma (equivale a un GBM simulado; sirve
-    para comparar contra el Modelo 1).
+  - modo "bootstrap": BLOCK bootstrap — copia tramos contiguos de `bloque` minutos de los retornos REALES
+    (dentro de una misma sesión). Al copiar tramos enteros conserva la autocorrelación de corto plazo
+    (el rebote bid-ask, las rachas), que es justo lo que el remuestreo minuto a minuto destruye y lo que
+    hacía que el modelo sobrestimara cuánto se mueve una hora.
+  - modo "normal": incrementos gaussianos con la sigma calibrada (equivale a un GBM simulado; sirve para
+    comparar contra el Modelo 1).
 Lo que el GBM analítico no puede dar sin fórmulas complicadas y aquí sale gratis: probabilidad de tocar el
 take-profit antes que el stop-loss DENTRO del horizonte (depende del camino, no solo del precio final).
 """
@@ -14,33 +16,55 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from common import estimar_parametros, senal, explicar_senal
+from common import (estimar_parametros, senal, explicar_senal, minutos_en_sesion_actual,
+                    percentil_empirico, calibracion)
 
 PERCENTILES = (5, 10, 25, 50, 75, 90, 95)
+MIN_ANCLA = 5
 
 
-def _incrementos(rng, retornos, m, sigma, shape, modo):
-    if modo == "bootstrap":
-        return rng.choice(retornos, size=shape, replace=True)
-    return rng.normal(m, sigma, size=shape)
+# ---------------- generadores de incrementos ----------------
+def _bloques_validos(rs, L):
+    """Concatena los retornos por sesión y devuelve los índices de inicio de bloque que no cruzan sesión."""
+    r1 = np.concatenate(rs)
+    starts, off = [], 0
+    for r in rs:
+        if len(r) >= L:
+            starts.append(np.arange(off, off + len(r) - L + 1))
+        off += len(r)
+    if not starts:                       # sesiones más cortas que el bloque: usar bloques de 1 min
+        return r1, np.arange(len(r1)), 1
+    return r1, np.concatenate(starts), L
 
 
-def simular(S0, retornos, m, sigma, horizonte, n_sims=10000, modo="bootstrap", rng=None):
+def _incrementos(rng, p, shape, modo, bloque):
+    n_sims, h = shape
+    if modo != "bootstrap":
+        return rng.normal(p["m"], p["sigma"], size=shape)
+    r1, starts, L = _bloques_validos(p["retornos_sesion"], bloque)
+    if not p["usar_drift"]:
+        r1 = r1 - p["m_est"]             # quitar la tendencia de la muestra
+    nb = int(math.ceil(h / L))
+    st = rng.choice(starts, size=(n_sims, nb))
+    idx = st[:, :, None] + np.arange(L)[None, None, :]
+    return r1[idx].reshape(n_sims, nb * L)[:, :h]
+
+
+def simular(S0, p, horizonte, n_sims=10000, modo="bootstrap", bloque=30, rng=None):
     """Matriz (n_sims x horizonte) de precios simulados."""
     rng = rng or np.random.default_rng()
-    inc = _incrementos(rng, retornos, m, sigma, (n_sims, horizonte), modo)
+    inc = _incrementos(rng, p, (n_sims, horizonte), modo, bloque)
     return S0 * np.exp(np.cumsum(inc, axis=1))
 
 
 def bandas(paths, percentiles=PERCENTILES):
-    return {p: np.percentile(paths, p, axis=0) for p in percentiles}
+    return {q: np.percentile(paths, q, axis=0) for q in percentiles}
 
 
-def percentil_actual(S_now, S_ancla, retornos, m, sigma, n, n_sims, modo, rng):
-    """Percentil empírico del retorno observado en n minutos dentro de la distribución simulada."""
-    R = _incrementos(rng, retornos, m, sigma, (n_sims, n), modo).sum(axis=1)
-    obs = math.log(S_now / S_ancla)
-    return 100 * float((R < obs).mean())
+def distribucion_ancla(p, n, n_sims, modo, bloque, rng):
+    """Distribución simulada del log-retorno de n minutos (ordenada)."""
+    R = _incrementos(rng, p, (n_sims, n), modo, bloque).sum(axis=1)
+    return np.sort(R)
 
 
 def prob_barreras(paths, tp, sl):
@@ -56,31 +80,54 @@ def prob_barreras(paths, tp, sl):
 
 
 def analizar(closes, S_now, horizonte=60, ancla=60, umbral_compra=10, umbral_venta=90,
-             n_sims=10000, modo="bootstrap", seed=None, tp=None, sl=None):
+             n_sims=10000, modo="bootstrap", bloque=30, seed=None, tp=None, sl=None,
+             sesiones=None, usar_drift=False):
     closes = np.asarray(closes, dtype=float)
-    p = estimar_parametros(closes)
+    p = estimar_parametros(closes, sesiones, escala=ancla, usar_drift=usar_drift)
     rng = np.random.default_rng(seed)
-    ancla = int(min(ancla, len(closes) - 1))
-    S_ancla = float(closes[-1 - ancla])
 
-    pct = percentil_actual(S_now, S_ancla, p["retornos"], p["m"], p["sigma"], ancla, n_sims, modo, rng)
+    disp = minutos_en_sesion_actual(closes, sesiones)
+    n = int(max(0, min(ancla, disp, len(closes) - 1)))
+    nota = ""
+    R = distribucion_ancla(p, max(n, MIN_ANCLA), n_sims, modo, bloque, rng)
+    if n < MIN_ANCLA:
+        pct, S_ancla, n = 50.0, float(closes[-1]), max(n, 1)
+        nota = "Primeros minutos de la sesión: aún no hay ventana para medir."
+    else:
+        S_ancla = float(closes[-1 - n])
+        pct = 100 * float(np.searchsorted(R, math.log(S_now / S_ancla)) / len(R))
+        if n < ancla:
+            nota = f"Sesión recién abierta: midiendo desde hace {n} min (no {ancla})."
     s = senal(pct, umbral_compra, umbral_venta)
 
-    paths = simular(S_now, p["retornos"], p["m"], p["sigma"], horizonte, n_sims, modo, rng)
+    # calibración: percentil que este modelo le habría dado a cada ventana real del histórico
+    if n == ancla:
+        pct_hist = 100 * np.searchsorted(R, p["ventanas"]) / len(R)
+        pct_emp = percentil_empirico(math.log(S_now / S_ancla), p["ventanas"])
+    else:
+        R_full = distribucion_ancla(p, ancla, n_sims, modo, bloque, rng)
+        pct_hist = 100 * np.searchsorted(R_full, p["ventanas"]) / len(R_full)
+        pct_emp = float("nan")
+    cal = calibracion(pct_hist, umbral_compra, umbral_venta)
+
+    paths = simular(S_now, p, horizonte, n_sims, modo, bloque, rng)
     b = bandas(paths)
     final = paths[:, -1]
     tp = float(tp) if tp else float(b[90][-1])
     sl = float(sl) if sl else float(b[10][-1])
 
     return {
-        "modelo": f"Montecarlo ({modo}, {n_sims:,} caminos)",
+        "modelo": f"Montecarlo ({modo}{f', bloques de {bloque} min' if modo == 'bootstrap' else ''}, {n_sims:,} caminos)",
         "precio": S_now,
         "precio_ancla": S_ancla,
-        "ancla": ancla,
+        "ancla": n,
+        "nota": nota,
         "horizonte": horizonte,
         "percentil": pct,
+        "percentil_empirico": pct_emp,
+        "calibracion": cal,
         "senal": s,
-        "explicacion": explicar_senal(s, pct, ancla),
+        "explicacion": explicar_senal(s, pct, n),
         "params": p,
         "t": np.arange(1, horizonte + 1),
         "bandas": b,
@@ -122,13 +169,14 @@ def figura(df, res, n_hist=120):
 
 
 def resumen(res):
-    p, bz = res["params"], res["barreras"]
+    p, bz, c = res["params"], res["barreras"], res["calibracion"]
     return "\n".join([
         f"== {res['modelo']} ==",
         f"Precio actual: {res['precio']:.2f}   (hace {res['ancla']} min: {res['precio_ancla']:.2f})",
-        f"sigma/min {p['sigma']*100:.3f}%  | sigma/día {p['sigma_dia']*100:.2f}%",
-        f"Percentil del precio actual: {res['percentil']:.1f}",
-        f"SEÑAL: {res['senal']}  -> {res['explicacion']}",
+        f"sigma/min bruta {p['sigma1']*100:.3f}% -> calibrada a {p['escala']} min {p['sigma']*100:.3f}% (ratio {p['vr']:.2f})",
+        f"Percentil del precio actual: {res['percentil']:.1f} | empírico {res['percentil_empirico']:.0f}",
+        f"Calibración {c['n']} ventanas: zona COMPRA {c['compra']:.0f}% · zona VENTA {c['venta']:.0f}%",
+        f"SEÑAL: {res['senal']}  -> {res['explicacion']}" + (f"  [{res['nota']}]" if res["nota"] else ""),
         f"Niveles a {res['horizonte']} min: " + "  ".join(f"{k}={v:.2f}" for k, v in res["niveles_horizonte"].items()),
         f"Take-profit {res['take_profit']:.2f} | Stop-loss {res['stop_loss']:.2f}",
         f"P(sube) {res['prob_subir']*100:.0f}% | toca TP primero {bz['tp_primero']*100:.0f}% | "
@@ -144,7 +192,8 @@ if __name__ == "__main__":
     df, px, ts = da.cargar(config.SYMBOL, config.ALPACA_KEY, config.ALPACA_SECRET,
                            dias=config.DIAS_HISTORIA, feed=config.FEED, solo_regular=config.SOLO_HORARIO_REGULAR)
     res = analizar(df["close"].values, px, config.HORIZONTE, config.ANCLA, config.UMBRAL_COMPRA,
-                   config.UMBRAL_VENTA, n_sims=config.N_SIMULACIONES, modo=config.MODO_MC)
+                   config.UMBRAL_VENTA, n_sims=config.N_SIMULACIONES, modo=config.MODO_MC, bloque=config.BLOQUE_MC,
+                   sesiones=df["t"].dt.date.values, usar_drift=config.USAR_DRIFT)
     print(f"{config.SYMBOL} @ {ts}\n")
     print(resumen(res))
     fig = figura(df, res)

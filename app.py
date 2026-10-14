@@ -55,11 +55,15 @@ with st.sidebar:
     ancla = st.slider("Ancla: medir desde hace (min)", 5, 390, config.ANCLA, step=5)
     umbral_c = st.slider("Umbral compra (percentil ≤)", 1, 40, config.UMBRAL_COMPRA)
     umbral_v = st.slider("Umbral venta (percentil ≥)", 60, 99, config.UMBRAL_VENTA)
+    usar_drift = st.toggle("Usar drift (tendencia de los últimos días)", value=config.USAR_DRIFT,
+                           help="Apagado = tendencia 0. En pocos días el drift es ruido y sesga la señal hacia la tendencia reciente.")
 
     st.header("Montecarlo")
     n_sims = st.select_slider("Caminos", [1000, 5000, 10000, 20000, 50000], value=config.N_SIMULACIONES)
     modo = st.radio("Incrementos", ["bootstrap", "normal"], index=0 if config.MODO_MC == "bootstrap" else 1,
-                    help="bootstrap = remuestrea retornos reales (colas gordas). normal = gaussiano.")
+                    help="bootstrap = copia tramos de retornos reales (colas gordas). normal = gaussiano.")
+    bloque = st.slider("Bloque bootstrap (min)", 5, 60, config.BLOQUE_MC, step=5,
+                       help="Largo de los tramos reales que se copian. Conserva rachas y rebote bid-ask.")
 
     st.header("Actualización")
     auto = st.toggle("Auto-refrescar", value=True)
@@ -101,11 +105,18 @@ def panel_modelo(res, fig, extra_metrics):
         m3, m4 = st.columns(2)
         m3.metric("Take-profit", f"{res['take_profit']:.2f}", f"{(res['take_profit'] / res['precio'] - 1) * 100:+.2f}%")
         m4.metric("Stop-loss", f"{res['stop_loss']:.2f}", f"{(res['stop_loss'] / res['precio'] - 1) * 100:+.2f}%")
+        if res["nota"]:
+            st.info(res["nota"])
         for lbl, val in extra_metrics:
             st.write(f"**{lbl}:** {val}")
-        p = res["params"]
-        st.caption(f"σ/min {p['sigma'] * 100:.3f}% · σ/día {p['sigma_dia'] * 100:.2f}% · "
-                   f"drift/hora {p['m'] * 60 * 100:+.3f}% · {p['n']} retornos")
+        p, c = res["params"], res["calibracion"]
+        pe = res["percentil_empirico"]
+        st.write(f"**Calibración ({c['n']} ventanas de {p['escala']} min):** zona COMPRA {c['compra']:.0f}% · "
+                 f"zona VENTA {c['venta']:.0f}% de las veces" +
+                 (f" · percentil empírico de ahora {pe:.0f}" if pe == pe else ""))
+        st.caption(f"σ/min bruta {p['sigma1'] * 100:.3f}% → calibrada a {p['escala']} min {p['sigma'] * 100:.3f}% "
+                   f"(ratio {p['vr']:.2f}) · σ/{p['escala']}min {p['sigma_h'] * 100:.2f}% · σ/día {p['sigma_dia'] * 100:.2f}% · "
+                   f"drift/hora {p['m_est'] * 60 * 100:+.3f}% ({'usado' if p['usar_drift'] else 'ignorado'}) · {p['n']} retornos")
         st.dataframe(tabla_niveles(res), hide_index=True, width="stretch")
     with c2:
         st.plotly_chart(fig, width="stretch")
@@ -122,20 +133,22 @@ def cuerpo():
         return
 
     closes = df["close"].values
+    sesiones = df["t"].dt.date.values
     st.caption(f"{symbol} · {len(df)} velas de 1 min ({df['t'].iloc[0]:%d %b} → {df['t'].iloc[-1]:%d %b %H:%M} NY) · "
                f"último trade {px:.2f} @ {ts:%H:%M:%S} NY · feed {feed} · actualizado {time.strftime('%H:%M:%S')}")
 
     t1, t2, t3 = st.tabs(["Modelo 1 · GBM analítico", "Modelo 2 · Montecarlo", "Exportar datos"])
 
     with t1:
-        r1 = gbm.analizar(closes, px, horizonte, ancla, umbral_c, umbral_v)
+        r1 = gbm.analizar(closes, px, horizonte, ancla, umbral_c, umbral_v, sesiones=sesiones, usar_drift=usar_drift)
         panel_modelo(r1, gbm.figura(df, r1), [
             ("P(precio sube en el horizonte)", f"{r1['prob_subir'] * 100:.0f}%"),
             ("P(toca TP antes que SL) — sin límite de tiempo", f"{r1['prob_tp_antes_sl'] * 100:.0f}%"),
         ])
 
     with t2:
-        r2 = mc.analizar(closes, px, horizonte, ancla, umbral_c, umbral_v, n_sims=n_sims, modo=modo)
+        r2 = mc.analizar(closes, px, horizonte, ancla, umbral_c, umbral_v, n_sims=n_sims, modo=modo, bloque=bloque,
+                         sesiones=sesiones, usar_drift=usar_drift)
         bz = r2["barreras"]
         panel_modelo(r2, mc.figura(df, r2), [
             ("P(precio sube en el horizonte)", f"{r2['prob_subir'] * 100:.0f}%"),

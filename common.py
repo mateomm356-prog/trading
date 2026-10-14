@@ -6,28 +6,87 @@ MIN_POR_DIA = 390        # minutos de sesión regular
 DIAS_POR_ANO = 252
 
 
-def log_returns(closes):
-    c = np.asarray(closes, dtype=float)
-    return np.diff(np.log(c))
+# ---------------- retornos ----------------
+def ids_sesion(closes, sesiones=None):
+    """Convierte etiquetas de sesión (fechas) en enteros 0..K-1 en orden cronológico."""
+    n = len(closes)
+    if sesiones is None:
+        return np.zeros(n, dtype=int)
+    _, ids = np.unique(np.asarray(sesiones), return_inverse=True)
+    return ids.reshape(-1)
 
 
-def estimar_parametros(closes):
+def retornos_por_sesion(closes, sesiones=None):
+    """Lista de arrays de log-retornos de 1 min, uno por sesión: NUNCA cruza la noche (los gaps de apertura no cuentan)."""
+    closes = np.asarray(closes, dtype=float)
+    ids = ids_sesion(closes, sesiones)
+    out = []
+    for k in np.unique(ids):
+        c = closes[ids == k]
+        if len(c) > 1:
+            out.append(np.diff(np.log(c)))
+    return out
+
+
+def retornos_ventana(rs, h):
+    """Log-retornos de ventanas de h minutos (solapadas), sin cruzar sesión. Es la 'población de horas' real."""
+    out = []
+    for r in rs:
+        if len(r) >= h:
+            cs = np.concatenate([[0.0], np.cumsum(r)])
+            out.append(cs[h:] - cs[:-h])
+    return np.concatenate(out) if out else np.array([])
+
+
+def minutos_en_sesion_actual(closes, sesiones=None):
+    """Cuántos retornos de 1 min hay dentro de la última sesión (para no anclar en el día anterior)."""
+    ids = ids_sesion(closes, sesiones)
+    return int((ids == ids[-1]).sum()) - 1
+
+
+def estimar_parametros(closes, sesiones=None, escala=60, usar_drift=False):
     """
-    Estima los parámetros del GBM a partir de precios de cierre de 1 minuto.
-      m     = drift del log-precio por minuto  (= mu - sigma^2/2)
-      sigma = volatilidad por minuto
-      mu    = drift del precio (GBM)           (= m + sigma^2/2)
+    Estima los parámetros del GBM a partir de cierres de 1 min.
+
+    Problema clásico: la sigma de 1 min viene inflada por el rebote bid-ask (ruido de microestructura) y, si no
+    se separan las sesiones, por los gaps de apertura. Escalarla con sqrt(60) sobrestima lo que se mueve una hora
+    y el percentil queda comprimido (nunca llega a 10 ni a 90).
+
+    Solución: calibrar sigma a la ESCALA del ancla (ventanas de `escala` min dentro de cada sesión) y convertirla
+    a sigma/min efectiva = sigma_h / sqrt(h). Devuelve también el 'variance ratio' (sigma_cal^2 / sigma_1min^2):
+    si es < 1 el ruido de 1 min estaba inflando la volatilidad.
     """
-    r = log_returns(closes)
-    if len(r) < 30:
-        raise ValueError(f"Muy pocos datos ({len(r)} retornos). Necesito al menos 30 precios.")
-    m = float(r.mean())
-    sigma = float(r.std(ddof=1))
+    rs = retornos_por_sesion(closes, sesiones)
+    r1 = np.concatenate(rs) if rs else np.array([])
+    if len(r1) < 30:
+        raise ValueError(f"Muy pocos datos ({len(r1)} retornos). Necesito al menos 30 precios.")
+
+    sigma1 = float(r1.std(ddof=1))
+    m_est = float(r1.mean())
+    m = m_est if usar_drift else 0.0
+
+    escala = int(max(5, escala))
+    rh = retornos_ventana(rs, escala)
+    if len(rh) >= 20:
+        sigma_h = float(rh.std(ddof=1))
+        sigma = sigma_h / math.sqrt(escala)
+    else:                                   # no hay ventanas suficientes: caer al escalado clásico
+        sigma = sigma1
+        sigma_h = sigma1 * math.sqrt(escala)
+
     return {
-        "retornos": r,
-        "n": int(len(r)),
+        "retornos": r1,
+        "retornos_sesion": rs,
+        "ventanas": rh,                     # retornos reales de `escala` min
+        "escala": escala,
+        "n": int(len(r1)),
         "m": m,
-        "sigma": sigma,
+        "m_est": m_est,
+        "usar_drift": usar_drift,
+        "sigma1": sigma1,                   # sigma/min bruta (1 min)
+        "sigma": sigma,                     # sigma/min calibrada a la escala del ancla
+        "sigma_h": sigma_h,                 # sigma de una ventana de `escala` min
+        "vr": (sigma / sigma1) ** 2 if sigma1 > 0 else 1.0,
         "mu": m + sigma ** 2 / 2,
         "sigma_dia": sigma * math.sqrt(MIN_POR_DIA),
         "sigma_anual": sigma * math.sqrt(MIN_POR_DIA * DIAS_POR_ANO),
@@ -35,8 +94,14 @@ def estimar_parametros(closes):
     }
 
 
+# ---------------- normal ----------------
 def norm_cdf(z):
     return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def norm_cdf_vec(z):
+    z = np.asarray(z, dtype=float)
+    return 0.5 * (1.0 + np.vectorize(math.erf)(z / math.sqrt(2.0)))
 
 
 def norm_ppf(p):
@@ -66,6 +131,7 @@ def norm_ppf(p):
             ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
 
 
+# ---------------- señal ----------------
 def senal(percentil, umbral_compra=10, umbral_venta=90):
     """Zona según el percentil en que cae el precio actual dentro de la distribución del modelo."""
     if percentil <= umbral_compra:
@@ -84,3 +150,21 @@ def explicar_senal(s, percentil, ancla):
                 f"desde hace {ancla} min: está estadísticamente caro frente a su propia dinámica.")
     return (f"El precio está en el percentil {percentil:.0f}: dentro del rango normal. "
             f"Sin ventaja estadística, mejor esperar.")
+
+
+def percentil_empirico(obs, ventanas):
+    """Percentil del retorno observado entre las ventanas reales del histórico (sin modelo)."""
+    if len(ventanas) == 0:
+        return float("nan")
+    return 100.0 * float((ventanas < obs).mean())
+
+
+def calibracion(percentiles_hist, umbral_compra, umbral_venta):
+    """Qué fracción de las ventanas históricas habría caído en zona COMPRA / VENTA con este modelo.
+    Si el modelo está bien calibrado, debe dar ≈ umbral_compra% y ≈ (100-umbral_venta)%."""
+    p = np.asarray(percentiles_hist, dtype=float)
+    if len(p) == 0:
+        return {"compra": float("nan"), "venta": float("nan"), "n": 0}
+    return {"compra": 100 * float((p <= umbral_compra).mean()),
+            "venta": 100 * float((p >= umbral_venta).mean()),
+            "n": int(len(p))}
