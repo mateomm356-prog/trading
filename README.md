@@ -35,20 +35,6 @@ python data_alpaca.py         # solo probar la conexión
 ```
 Si no creas el secrets.toml, la app te pide las llaves en la barra lateral.
 
-## 4. Alertas al celular (Telegram)
-1. En Telegram busca **@BotFather** → `/newbot` → ponle nombre → copia el **token**.
-2. Abre el chat con tu bot nuevo y escríbele `hola` (así el script encuentra tu chat).
-3. En `.streamlit/secrets.toml` agrega:
-   ```
-   TELEGRAM_TOKEN = "123456789:AAxxxxxxxx..."
-   ```
-4. Prueba: `python alertas.py --prueba` → te debe llegar un mensaje.
-5. Deja corriendo: `python alertas.py`. Revisa cada 60 seg en horario de mercado y te escribe
-   solo cuando la señal cambia a COMPRA/VENTA (y cuando vuelve a NEUTRO). Fuera de horario se duerme solo.
-
-Para vigilar varias acciones: en `config.py` → `SIMBOLOS_ALERTA = ["SMCI", "NVDA", "QBTS"]`.
-Necesita el PC prendido con la ventana abierta mientras el mercado está abierto (9:30–16:00 NY).
-
 ## Cómo leer la señal
 - Se estima σ con velas de 1 min de los últimos N días, **calibrada a la escala del ancla** (ventanas de 60 min
   dentro de cada sesión, sin contar los gaps de apertura). La σ cruda de 1 min viene inflada por el rebote bid-ask;

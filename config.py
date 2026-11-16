@@ -30,11 +30,7 @@ ALPACA_KEY = _llave("APCA_API_KEY_ID")
 ALPACA_SECRET = _llave("APCA_API_SECRET_KEY")
 
 SYMBOL = "SMCI"
-SIMBOLOS_ALERTA = ["SMCI"]   # alertas.py vigila estos (ej. ["SMCI", "NVDA", "QBTS"])
-
-# Telegram (para alertas.py). Mismo sitio que las llaves de Alpaca: secrets.toml o variables de entorno.
-TELEGRAM_TOKEN = _llave("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = _llave("TELEGRAM_CHAT_ID")
+SIMBOLOS_PAPEL = ["SMCI"]    # paper_trading.py opera estos (ej. ["SMCI", "NVDA", "QBTS"])
 
 # "iex"  = tiempo real en el plan gratis (solo trades que pasan por la bolsa IEX).
 # "sip"  = mercado completo, pero en el plan gratis NO deja pedir los últimos 15 min.
@@ -54,3 +50,10 @@ USAR_DRIFT = False  # False = tendencia intradía = 0 (en 5 días el drift es ru
 N_SIMULACIONES = 10000
 MODO_MC = "bootstrap"   # "bootstrap" = copia tramos de retornos reales (colas gordas) | "normal" = gaussiano
 BLOQUE_MC = 30          # minutos por tramo en el block bootstrap (conserva la autocorrelación de corto plazo)
+
+# Estrategia "ventana segura" (ver estrategia.py)
+USAR_CONFIRMACION = True      # comprar solo cuando ya empezó a rebotar (no mientras sigue cayendo)
+USAR_TENDENCIA = False        # no comprar si la tendencia de 2 horas es muy bajista
+USAR_SALIDA_TEMPRANA = True   # vender si estás en pérdida y sigue cayendo fuerte
+ARMADO_MIN = 30               # minutos que la oportunidad sigue "armada" después de tocar la zona
+Z_SALIDA = -1.5               # qué tan fuerte debe caer (en desviaciones) para la salida temprana
